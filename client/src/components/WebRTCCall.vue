@@ -74,7 +74,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onUnmounted } from 'vue'
 
 // 视频元素引用
 const localVideo = ref<HTMLVideoElement>()
@@ -135,7 +135,7 @@ const createPeerConnection = () => {
   
   // 处理远程流
   peerConnection.ontrack = (event) => {
-    if (remoteVideo.value) {
+    if (remoteVideo.value && event.streams[0]) {
       remoteVideo.value.srcObject = event.streams[0]
     }
   }
