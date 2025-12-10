@@ -44,7 +44,17 @@
     <div class="signaling-section">
       <h3>信令交换区域</h3>
       <div class="signaling-box">
-        <h4>发送给对方的信令 (复制给对方):</h4>
+        <div class="signaling-header">
+          <h4>发送给对方的信令 (复制给对方):</h4>
+          <button 
+            @click="copyLocalSignaling" 
+            :disabled="!localSignaling.trim()"
+            class="copy-button"
+            :class="{ 'copied': localCopied }"
+          >
+            {{ localCopied ? '已复制!' : '📋 复制' }}
+          </button>
+        </div>
         <textarea 
           v-model="localSignaling" 
           readonly 
@@ -54,7 +64,16 @@
       </div>
       
       <div class="signaling-box">
-        <h4>接收对方的信令 (粘贴对方发来的):</h4>
+        <div class="signaling-header">
+          <h4>接收对方的信令 (粘贴对方发来的):</h4>
+          <button 
+            @click="clearRemoteSignaling" 
+            :disabled="!remoteSignaling.trim()"
+            class="clear-button"
+          >
+            🗑️ 清空
+          </button>
+        </div>
         <textarea 
           v-model="remoteSignaling" 
           placeholder="请粘贴对方发来的信令数据"
@@ -89,6 +108,13 @@ const iceConnectionState = ref('new')
 // 信令数据
 const localSignaling = ref('')
 const remoteSignaling = ref('')
+
+// 复制状态
+const localCopied = ref(false)
+
+// ICE 候选收集
+const iceCandidates = ref<RTCIceCandidate[]>([])
+const isGatheringComplete = ref(false)
 
 // WebRTC 相关变量
 let localStream: MediaStream | null = null
@@ -152,10 +178,41 @@ const createPeerConnection = () => {
   // 收集 ICE 候选
   peerConnection.onicecandidate = (event) => {
     if (event.candidate) {
-      // 在实际应用中，这里应该通过信令服务器发送给对方
+      iceCandidates.value.push(event.candidate)
       console.log('新的 ICE 候选:', event.candidate)
+      
+      // 实时更新信令数据，包含所有 ICE 候选
+      updateSignalingWithCandidates()
+    } else {
+      // ICE 候选收集完成
+      isGatheringComplete.value = true
+      console.log('ICE 候选收集完成')
+      updateSignalingWithCandidates()
     }
   }
+  
+  // ICE 收集状态变化
+  peerConnection.onicegatheringstatechange = () => {
+    console.log('ICE 收集状态:', peerConnection!.iceGatheringState)
+    if (peerConnection!.iceGatheringState === 'complete') {
+      isGatheringComplete.value = true
+      updateSignalingWithCandidates()
+    }
+  }
+}
+
+// 更新信令数据，包含 ICE 候选
+const updateSignalingWithCandidates = () => {
+  if (!peerConnection || !peerConnection.localDescription) return
+  
+  const signaling = {
+    type: peerConnection.localDescription.type,
+    sdp: peerConnection.localDescription,
+    candidates: iceCandidates.value,
+    gatheringComplete: isGatheringComplete.value
+  }
+  
+  localSignaling.value = JSON.stringify(signaling, null, 2)
 }
 
 // 创建通话邀请 (Offer)
@@ -164,16 +221,33 @@ const createOffer = async () => {
     createPeerConnection()
   }
   
+  // 重置 ICE 候选
+  iceCandidates.value = []
+  isGatheringComplete.value = false
+  
   try {
     const offer = await peerConnection!.createOffer()
     await peerConnection!.setLocalDescription(offer)
     
+    // 初始信令（不包含 ICE 候选）
     localSignaling.value = JSON.stringify({
       type: 'offer',
-      sdp: offer
+      sdp: offer,
+      candidates: [],
+      gatheringComplete: false
     }, null, 2)
     
-    connectionState.value = '等待对方响应...'
+    connectionState.value = '正在收集网络信息...'
+    
+    // 等待 ICE 候选收集完成或超时
+    setTimeout(() => {
+      if (!isGatheringComplete.value) {
+        console.log('ICE 候选收集超时，使用当前候选')
+        isGatheringComplete.value = true
+        updateSignalingWithCandidates()
+      }
+    }, 5000) // 5秒超时
+    
   } catch (error) {
     console.error('创建 Offer 失败:', error)
   }
@@ -185,19 +259,64 @@ const createAnswer = async () => {
     createPeerConnection()
   }
   
+  // 重置 ICE 候选
+  iceCandidates.value = []
+  isGatheringComplete.value = false
+  
   try {
     const answer = await peerConnection!.createAnswer()
     await peerConnection!.setLocalDescription(answer)
     
+    // 初始信令（不包含 ICE 候选）
     localSignaling.value = JSON.stringify({
       type: 'answer',
-      sdp: answer
+      sdp: answer,
+      candidates: [],
+      gatheringComplete: false
     }, null, 2)
     
-    connectionState.value = '已发送应答，等待连接建立...'
+    connectionState.value = '正在收集网络信息...'
+    
+    // 等待 ICE 候选收集完成或超时
+    setTimeout(() => {
+      if (!isGatheringComplete.value) {
+        console.log('ICE 候选收集超时，使用当前候选')
+        isGatheringComplete.value = true
+        updateSignalingWithCandidates()
+      }
+    }, 5000) // 5秒超时
+    
   } catch (error) {
     console.error('创建 Answer 失败:', error)
   }
+}
+
+// 复制本地信令到剪贴板
+const copyLocalSignaling = async () => {
+  try {
+    await navigator.clipboard.writeText(localSignaling.value)
+    localCopied.value = true
+    setTimeout(() => {
+      localCopied.value = false
+    }, 2000)
+  } catch (error) {
+    console.error('复制失败:', error)
+    // 降级方案：选择文本
+    const textarea = document.querySelector('.signaling-textarea[readonly]') as HTMLTextAreaElement
+    if (textarea) {
+      textarea.select()
+      document.execCommand('copy')
+      localCopied.value = true
+      setTimeout(() => {
+        localCopied.value = false
+      }, 2000)
+    }
+  }
+}
+
+// 清空远程信令
+const clearRemoteSignaling = () => {
+  remoteSignaling.value = ''
 }
 
 // 处理远程信令
@@ -211,12 +330,41 @@ const processRemoteSignaling = async () => {
     
     if (signaling.type === 'offer') {
       await peerConnection!.setRemoteDescription(signaling.sdp)
+      
+      // 添加远程 ICE 候选
+      if (signaling.candidates && Array.isArray(signaling.candidates)) {
+        for (const candidate of signaling.candidates) {
+          try {
+            await peerConnection!.addIceCandidate(candidate)
+            console.log('添加远程 ICE 候选成功:', candidate)
+          } catch (error) {
+            console.error('添加远程 ICE 候选失败:', error)
+          }
+        }
+      }
+      
       hasRemoteOffer.value = true
       connectionState.value = '收到通话邀请，可以接受'
+      
     } else if (signaling.type === 'answer') {
       await peerConnection!.setRemoteDescription(signaling.sdp)
+      
+      // 添加远程 ICE 候选
+      if (signaling.candidates && Array.isArray(signaling.candidates)) {
+        for (const candidate of signaling.candidates) {
+          try {
+            await peerConnection!.addIceCandidate(candidate)
+            console.log('添加远程 ICE 候选成功:', candidate)
+          } catch (error) {
+            console.error('添加远程 ICE 候选失败:', error)
+          }
+        }
+      }
+      
       connectionState.value = '正在建立连接...'
+      
     } else if (signaling.type === 'ice-candidate') {
+      // 兼容单个 ICE 候选格式
       await peerConnection!.addIceCandidate(signaling.candidate)
     }
     
@@ -253,6 +401,9 @@ const hangup = () => {
   iceConnectionState.value = 'closed'
   localSignaling.value = ''
   remoteSignaling.value = ''
+  localCopied.value = false
+  iceCandidates.value = []
+  isGatheringComplete.value = false
 }
 
 // 组件卸载时清理资源
@@ -334,9 +485,57 @@ onUnmounted(() => {
   text-align: left;
 }
 
+.signaling-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
 .signaling-box h4 {
   color: #666;
-  margin-bottom: 10px;
+  margin: 0;
+}
+
+.copy-button, .clear-button {
+  padding: 6px 12px;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  transition: all 0.2s;
+}
+
+.copy-button {
+  background-color: #42b883;
+  color: white;
+}
+
+.copy-button:hover:not(:disabled) {
+  background-color: #369870;
+}
+
+.copy-button:disabled {
+  background-color: #ccc;
+  cursor: not-allowed;
+}
+
+.copy-button.copied {
+  background-color: #28a745;
+}
+
+.clear-button {
+  background-color: #dc3545;
+  color: white;
+}
+
+.clear-button:hover:not(:disabled) {
+  background-color: #c82333;
+}
+
+.clear-button:disabled {
+  background-color: #ccc;
+  cursor: not-allowed;
 }
 
 .signaling-textarea {
