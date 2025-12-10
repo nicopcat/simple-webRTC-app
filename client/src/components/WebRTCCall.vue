@@ -48,6 +48,14 @@
         🔄 重新连接
       </button>
       
+      <button 
+        @click="forceRelayConnection" 
+        :disabled="!localStreamActive"
+        class="force-relay-button"
+      >
+        🛡️ 强制中继
+      </button>
+      
       <button @click="hangup" :disabled="!localStreamActive">
         挂断
       </button>
@@ -101,6 +109,18 @@
       <p><strong>连接状态:</strong> {{ connectionState }}</p>
       <p><strong>ICE 状态:</strong> {{ iceConnectionState }}</p>
       <p><strong>收集到的候选数:</strong> {{ iceCandidates.length }}</p>
+      <div v-if="iceCandidates.length > 0" class="candidate-stats">
+        <p><strong>候选类型分布:</strong></p>
+        <div class="stats-grid">
+          <span class="stat-item">本地: {{ candidateStats.host }}</span>
+          <span class="stat-item">服务器反射: {{ candidateStats.srflx }}</span>
+          <span class="stat-item">中继: {{ candidateStats.relay }}</span>
+          <span class="stat-item">对等反射: {{ candidateStats.prflx }}</span>
+        </div>
+        <p v-if="candidateStats.relay === 0" class="warning">
+          ⚠️ 缺少中继候选，可能影响连接成功率
+        </p>
+      </div>
       <p v-if="retryCount > 0"><strong>重试次数:</strong> {{ retryCount }}/{{ maxRetries }}</p>
       <div v-if="networkDiagnostic" class="diagnostic">
         <h4>🔍 网络诊断结果:</h4>
@@ -147,25 +167,31 @@ const networkDiagnostic = ref<Record<string, { success: boolean; error?: string 
 const retryCount = ref(0)
 const maxRetries = 3
 
+// 候选统计
+const candidateStats = ref<Record<string, number>>({
+  host: 0,
+  srflx: 0,
+  relay: 0,
+  prflx: 0
+})
+
 // WebRTC 相关变量
 let localStream: MediaStream | null = null
 let peerConnection: RTCPeerConnection | null = null
 
-// ICE 服务器配置 - 添加更多 STUN 服务器和免费 TURN 服务器
+// ICE 服务器配置 - 添加更多强力 TURN 服务器
 const iceServers = {
   iceServers: [
     // Google STUN 服务器
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:stun3.l.google.com:19302' },
-    { urls: 'stun:stun4.l.google.com:19302' },
     
     // 其他公共 STUN 服务器
     { urls: 'stun:stun.cloudflare.com:3478' },
-    { urls: 'stun:stun.nextcloud.com:443' },
+    { urls: 'stun:relay.webwormhole.io:3478' },
     
-    // 免费 TURN 服务器 (OpenRelay)
+    // 免费 TURN 服务器 (OpenRelay) - 多端口配置
     {
       urls: 'turn:openrelay.metered.ca:80',
       username: 'openrelayproject',
@@ -180,10 +206,26 @@ const iceServers = {
       urls: 'turn:openrelay.metered.ca:443?transport=tcp',
       username: 'openrelayproject',
       credential: 'openrelayproject'
-    }
+    },
+    {
+      urls: 'turns:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    
+    // 备用 TURN 服务器
+    {
+      urls: 'turn:relay.webwormhole.io:3478',
+      username: 'guest',
+      credential: 'somepassword'
+    },
+    
+    // Twilio STUN (公共)
+    { urls: 'stun:global.stun.twilio.com:3478' }
   ],
-  // 增加连接超时时间
-  iceCandidatePoolSize: 10
+  // 强制使用 TURN 服务器的配置
+  iceCandidatePoolSize: 20,
+  iceTransportPolicy: 'all' as RTCIceTransportPolicy // 允许所有类型的候选
 }
 
 // 开启本地视频
@@ -217,85 +259,8 @@ const createPeerConnection = () => {
     })
   }
   
-  // 处理远程流
-  peerConnection.ontrack = (event) => {
-    if (remoteVideo.value && event.streams[0]) {
-      remoteVideo.value.srcObject = event.streams[0]
-    }
-  }
-  
-  // 监听连接状态
-  peerConnection.onconnectionstatechange = () => {
-    connectionState.value = peerConnection!.connectionState
-  }
-  
-  peerConnection.oniceconnectionstatechange = () => {
-    iceConnectionState.value = peerConnection!.iceConnectionState
-    console.log('ICE 连接状态变化:', peerConnection!.iceConnectionState)
-    
-    // 根据 ICE 状态更新连接状态
-    switch (peerConnection!.iceConnectionState) {
-      case 'checking':
-        connectionState.value = '正在检查网络连接...'
-        break
-      case 'connected':
-        connectionState.value = '连接成功！'
-        retryCount.value = 0 // 重置重试计数
-        break
-      case 'completed':
-        connectionState.value = '连接已建立'
-        retryCount.value = 0 // 重置重试计数
-        break
-      case 'failed':
-        console.error('ICE 连接失败，可能需要 TURN 服务器')
-        handleConnectionFailure()
-        break
-      case 'disconnected':
-        connectionState.value = '连接已断开'
-        // 短暂断开可能会自动恢复，等待一段时间
-        setTimeout(() => {
-          if (peerConnection && peerConnection.iceConnectionState === 'disconnected') {
-            console.log('连接断开超时，尝试重新连接')
-            handleConnectionFailure()
-          }
-        }, 5000)
-        break
-      case 'closed':
-        connectionState.value = '连接已关闭'
-        break
-    }
-  }
-  
-  // 收集 ICE 候选
-  peerConnection.onicecandidate = (event) => {
-    if (event.candidate) {
-      iceCandidates.value.push(event.candidate)
-      console.log('新的 ICE 候选:', {
-        type: event.candidate.type,
-        protocol: event.candidate.protocol,
-        address: event.candidate.address,
-        port: event.candidate.port,
-        priority: event.candidate.priority
-      })
-      
-      // 实时更新信令数据，包含所有 ICE 候选
-      updateSignalingWithCandidates()
-    } else {
-      // ICE 候选收集完成
-      isGatheringComplete.value = true
-      console.log('ICE 候选收集完成，总共收集到', iceCandidates.value.length, '个候选')
-      updateSignalingWithCandidates()
-    }
-  }
-  
-  // ICE 收集状态变化
-  peerConnection.onicegatheringstatechange = () => {
-    console.log('ICE 收集状态:', peerConnection!.iceGatheringState)
-    if (peerConnection!.iceGatheringState === 'complete') {
-      isGatheringComplete.value = true
-      updateSignalingWithCandidates()
-    }
-  }
+  // 设置事件处理
+  setupPeerConnectionEvents()
 }
 
 // 更新信令数据，包含 ICE 候选
@@ -479,6 +444,36 @@ const testNetwork = async () => {
   connectionState.value = '网络诊断完成'
 }
 
+// 更新候选统计
+const updateCandidateStats = () => {
+  const stats = { host: 0, srflx: 0, relay: 0, prflx: 0 }
+  
+  iceCandidates.value.forEach(candidate => {
+    if (candidate.type && candidate.type in stats) {
+      stats[candidate.type as keyof typeof stats]++
+    }
+  })
+  
+  candidateStats.value = stats
+}
+
+// 记录候选摘要
+const logCandidatesSummary = () => {
+  console.log('候选类型统计:', {
+    '本地候选 (host)': candidateStats.value.host,
+    '服务器反射候选 (srflx)': candidateStats.value.srflx, 
+    '中继候选 (relay)': candidateStats.value.relay,
+    '对等反射候选 (prflx)': candidateStats.value.prflx
+  })
+  
+  // 检查是否有 TURN 候选
+  if (candidateStats.value.relay === 0) {
+    console.warn('⚠️ 没有收集到 TURN 中继候选，可能影响复杂网络环境下的连接')
+  } else {
+    console.log('✅ 成功收集到', candidateStats.value.relay, '个 TURN 中继候选')
+  }
+}
+
 // 处理连接失败
 const handleConnectionFailure = () => {
   retryCount.value++
@@ -520,6 +515,7 @@ const restartIceConnection = async () => {
     // 重置候选收集
     iceCandidates.value = []
     isGatheringComplete.value = false
+    candidateStats.value = { host: 0, srflx: 0, relay: 0, prflx: 0 }
     
     // 更新信令
     localSignaling.value = JSON.stringify({
@@ -535,6 +531,155 @@ const restartIceConnection = async () => {
   } catch (error) {
     console.error('ICE 重启失败:', error)
     connectionState.value = '重试失败'
+  }
+}
+
+// 强制使用中继连接
+const forceRelayConnection = async () => {
+  // 关闭现有连接
+  if (peerConnection) {
+    peerConnection.close()
+  }
+  
+  // 创建只使用 TURN 服务器的配置
+  const relayOnlyConfig = {
+    iceServers: [
+      {
+        urls: 'turn:openrelay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: 'turns:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      }
+    ],
+    iceTransportPolicy: 'relay' as RTCIceTransportPolicy, // 强制只使用中继
+    iceCandidatePoolSize: 10
+  }
+  
+  // 创建新的连接
+  peerConnection = new RTCPeerConnection(relayOnlyConfig)
+  
+  // 重新设置事件处理
+  setupPeerConnectionEvents()
+  
+  // 添加本地流
+  if (localStream) {
+    localStream.getTracks().forEach(track => {
+      peerConnection!.addTrack(track, localStream!)
+    })
+  }
+  
+  connectionState.value = '正在使用强制中继模式...'
+  
+  // 重置状态
+  iceCandidates.value = []
+  isGatheringComplete.value = false
+  candidateStats.value = { host: 0, srflx: 0, relay: 0, prflx: 0 }
+  hasRemoteOffer.value = false
+  
+  console.log('已切换到强制中继模式，请重新创建通话邀请')
+}
+
+// 设置 PeerConnection 事件处理（提取为独立函数）
+const setupPeerConnectionEvents = () => {
+  if (!peerConnection) return
+  
+  // 处理远程流
+  peerConnection.ontrack = (event) => {
+    if (remoteVideo.value && event.streams[0]) {
+      remoteVideo.value.srcObject = event.streams[0]
+    }
+  }
+  
+  // 监听连接状态
+  peerConnection.onconnectionstatechange = () => {
+    connectionState.value = peerConnection!.connectionState
+  }
+  
+  peerConnection.oniceconnectionstatechange = () => {
+    iceConnectionState.value = peerConnection!.iceConnectionState
+    console.log('ICE 连接状态变化:', peerConnection!.iceConnectionState)
+    
+    // 根据 ICE 状态更新连接状态
+    switch (peerConnection!.iceConnectionState) {
+      case 'checking':
+        connectionState.value = '正在检查网络连接...'
+        break
+      case 'connected':
+        connectionState.value = '连接成功！'
+        retryCount.value = 0 // 重置重试计数
+        break
+      case 'completed':
+        connectionState.value = '连接已建立'
+        retryCount.value = 0 // 重置重试计数
+        break
+      case 'failed':
+        console.error('ICE 连接失败，可能需要 TURN 服务器')
+        handleConnectionFailure()
+        break
+      case 'disconnected':
+        connectionState.value = '连接已断开'
+        // 短暂断开可能会自动恢复，等待一段时间
+        setTimeout(() => {
+          if (peerConnection && peerConnection.iceConnectionState === 'disconnected') {
+            console.log('连接断开超时，尝试重新连接')
+            handleConnectionFailure()
+          }
+        }, 5000)
+        break
+      case 'closed':
+        connectionState.value = '连接已关闭'
+        break
+    }
+  }
+  
+  // 收集 ICE 候选
+  peerConnection.onicecandidate = (event) => {
+    if (event.candidate) {
+      iceCandidates.value.push(event.candidate)
+      
+      // 详细的候选信息
+      const candidateInfo = {
+        type: event.candidate.type,
+        protocol: event.candidate.protocol,
+        address: event.candidate.address,
+        port: event.candidate.port,
+        priority: event.candidate.priority,
+        foundation: event.candidate.foundation,
+        component: event.candidate.component
+      }
+      
+      console.log('新的 ICE 候选:', candidateInfo)
+      
+      // 统计候选类型
+      updateCandidateStats()
+      
+      // 实时更新信令数据，包含所有 ICE 候选
+      updateSignalingWithCandidates()
+    } else {
+      // ICE 候选收集完成
+      isGatheringComplete.value = true
+      console.log('ICE 候选收集完成，总共收集到', iceCandidates.value.length, '个候选')
+      logCandidatesSummary()
+      updateSignalingWithCandidates()
+    }
+  }
+  
+  // ICE 收集状态变化
+  peerConnection.onicegatheringstatechange = () => {
+    console.log('ICE 收集状态:', peerConnection!.iceGatheringState)
+    if (peerConnection!.iceGatheringState === 'complete') {
+      isGatheringComplete.value = true
+      updateSignalingWithCandidates()
+    }
   }
 }
 
@@ -625,6 +770,7 @@ const hangup = () => {
   isGatheringComplete.value = false
   retryCount.value = 0
   networkDiagnostic.value = null
+  candidateStats.value = { host: 0, srflx: 0, relay: 0, prflx: 0 }
 }
 
 // 组件卸载时清理资源
@@ -706,6 +852,14 @@ onUnmounted(() => {
 
 .retry-button:hover:not(:disabled) {
   background-color: #e8690b !important;
+}
+
+.force-relay-button {
+  background-color: #6f42c1 !important;
+}
+
+.force-relay-button:hover:not(:disabled) {
+  background-color: #5a32a3 !important;
 }
 
 .signaling-section {
@@ -863,6 +1017,37 @@ onUnmounted(() => {
   font-size: 12px;
   color: #6c757d;
   font-style: italic;
+}
+
+.candidate-stats {
+  margin-top: 10px;
+  padding: 10px;
+  background-color: #e9ecef;
+  border-radius: 5px;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px;
+  margin: 5px 0;
+}
+
+.stat-item {
+  font-size: 12px;
+  padding: 2px 5px;
+  background-color: #fff;
+  border-radius: 3px;
+}
+
+.warning {
+  color: #856404;
+  background-color: #fff3cd;
+  border: 1px solid #ffeaa7;
+  padding: 5px;
+  border-radius: 3px;
+  font-size: 12px;
+  margin-top: 5px;
 }
 
 @media (max-width: 768px) {
