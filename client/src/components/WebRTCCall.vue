@@ -40,6 +40,14 @@
         🔍 网络诊断
       </button>
       
+      <button 
+        @click="restartIceConnection" 
+        :disabled="!peerConnection || iceConnectionState === 'connected'"
+        class="retry-button"
+      >
+        🔄 重新连接
+      </button>
+      
       <button @click="hangup" :disabled="!localStreamActive">
         挂断
       </button>
@@ -93,6 +101,7 @@
       <p><strong>连接状态:</strong> {{ connectionState }}</p>
       <p><strong>ICE 状态:</strong> {{ iceConnectionState }}</p>
       <p><strong>收集到的候选数:</strong> {{ iceCandidates.length }}</p>
+      <p v-if="retryCount > 0"><strong>重试次数:</strong> {{ retryCount }}/{{ maxRetries }}</p>
       <div v-if="networkDiagnostic" class="diagnostic">
         <h4>🔍 网络诊断结果:</h4>
         <div v-for="(result, server) in networkDiagnostic" :key="server" class="diagnostic-item">
@@ -133,6 +142,10 @@ const isGatheringComplete = ref(false)
 
 // 网络诊断
 const networkDiagnostic = ref<Record<string, { success: boolean; error?: string }> | null>(null)
+
+// 连接重试
+const retryCount = ref(0)
+const maxRetries = 3
 
 // WebRTC 相关变量
 let localStream: MediaStream | null = null
@@ -227,16 +240,25 @@ const createPeerConnection = () => {
         break
       case 'connected':
         connectionState.value = '连接成功！'
+        retryCount.value = 0 // 重置重试计数
         break
       case 'completed':
         connectionState.value = '连接已建立'
+        retryCount.value = 0 // 重置重试计数
         break
       case 'failed':
-        connectionState.value = '连接失败 - 网络不可达'
         console.error('ICE 连接失败，可能需要 TURN 服务器')
+        handleConnectionFailure()
         break
       case 'disconnected':
         connectionState.value = '连接已断开'
+        // 短暂断开可能会自动恢复，等待一段时间
+        setTimeout(() => {
+          if (peerConnection && peerConnection.iceConnectionState === 'disconnected') {
+            console.log('连接断开超时，尝试重新连接')
+            handleConnectionFailure()
+          }
+        }, 5000)
         break
       case 'closed':
         connectionState.value = '连接已关闭'
@@ -314,14 +336,15 @@ const createOffer = async () => {
     
     connectionState.value = '正在收集网络信息...'
     
-    // 等待 ICE 候选收集完成或超时
+    // 等待 ICE 候选收集完成或超时 - 延长到15秒
     setTimeout(() => {
       if (!isGatheringComplete.value) {
-        console.log('ICE 候选收集超时，使用当前候选')
+        console.log('Offer ICE 候选收集超时，使用当前候选:', iceCandidates.value.length, '个')
         isGatheringComplete.value = true
         updateSignalingWithCandidates()
+        connectionState.value = `等待对方响应... (已收集 ${iceCandidates.value.length} 个网络候选)`
       }
-    }, 5000) // 5秒超时
+    }, 15000) // 15秒超时
     
   } catch (error) {
     console.error('创建 Offer 失败:', error)
@@ -352,14 +375,15 @@ const createAnswer = async () => {
     
     connectionState.value = '正在收集网络信息...'
     
-    // 等待 ICE 候选收集完成或超时
+    // 等待 ICE 候选收集完成或超时 - 延长到15秒
     setTimeout(() => {
       if (!isGatheringComplete.value) {
-        console.log('ICE 候选收集超时，使用当前候选')
+        console.log('Answer ICE 候选收集超时，使用当前候选:', iceCandidates.value.length, '个')
         isGatheringComplete.value = true
         updateSignalingWithCandidates()
+        connectionState.value = `已发送应答，等待连接建立... (已收集 ${iceCandidates.value.length} 个网络候选)`
       }
-    }, 5000) // 5秒超时
+    }, 15000) // 15秒超时
     
   } catch (error) {
     console.error('创建 Answer 失败:', error)
@@ -455,6 +479,65 @@ const testNetwork = async () => {
   connectionState.value = '网络诊断完成'
 }
 
+// 处理连接失败
+const handleConnectionFailure = () => {
+  retryCount.value++
+  
+  if (retryCount.value <= maxRetries) {
+    connectionState.value = `连接失败，正在重试 (${retryCount.value}/${maxRetries})...`
+    console.log(`连接失败，开始第 ${retryCount.value} 次重试`)
+    
+    // 等待2秒后重试
+    setTimeout(() => {
+      restartIceConnection()
+    }, 2000)
+  } else {
+    connectionState.value = '连接失败 - 已达到最大重试次数'
+    console.error('连接失败，已达到最大重试次数')
+    
+    // 显示详细的错误信息和建议
+    alert(`连接失败！可能的原因：
+1. 网络环境过于复杂，需要更强的 TURN 服务器
+2. 防火墙阻止了 WebRTC 连接
+3. 双方网络都在严格的 NAT 后面
+
+建议：
+- 尝试使用不同的网络环境
+- 检查防火墙设置
+- 点击"网络诊断"查看详细信息`)
+  }
+}
+
+// 重启 ICE 连接
+const restartIceConnection = async () => {
+  if (!peerConnection) return
+  
+  try {
+    // ICE 重启
+    const offer = await peerConnection.createOffer({ iceRestart: true })
+    await peerConnection.setLocalDescription(offer)
+    
+    // 重置候选收集
+    iceCandidates.value = []
+    isGatheringComplete.value = false
+    
+    // 更新信令
+    localSignaling.value = JSON.stringify({
+      type: 'offer',
+      sdp: offer,
+      candidates: [],
+      gatheringComplete: false,
+      iceRestart: true
+    }, null, 2)
+    
+    connectionState.value = '正在重新收集网络信息...'
+    
+  } catch (error) {
+    console.error('ICE 重启失败:', error)
+    connectionState.value = '重试失败'
+  }
+}
+
 // 处理远程信令
 const processRemoteSignaling = async () => {
   try {
@@ -540,6 +623,8 @@ const hangup = () => {
   localCopied.value = false
   iceCandidates.value = []
   isGatheringComplete.value = false
+  retryCount.value = 0
+  networkDiagnostic.value = null
 }
 
 // 组件卸载时清理资源
@@ -613,6 +698,14 @@ onUnmounted(() => {
 
 .test-button:hover:not(:disabled) {
   background-color: #138496 !important;
+}
+
+.retry-button {
+  background-color: #fd7e14 !important;
+}
+
+.retry-button:hover:not(:disabled) {
+  background-color: #e8690b !important;
 }
 
 .signaling-section {
