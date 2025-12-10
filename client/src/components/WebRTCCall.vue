@@ -36,6 +36,10 @@
         接受通话邀请
       </button>
       
+      <button @click="testNetwork" class="test-button">
+        🔍 网络诊断
+      </button>
+      
       <button @click="hangup" :disabled="!localStreamActive">
         挂断
       </button>
@@ -88,6 +92,17 @@
     <div class="status">
       <p><strong>连接状态:</strong> {{ connectionState }}</p>
       <p><strong>ICE 状态:</strong> {{ iceConnectionState }}</p>
+      <p><strong>收集到的候选数:</strong> {{ iceCandidates.length }}</p>
+      <div v-if="networkDiagnostic" class="diagnostic">
+        <h4>🔍 网络诊断结果:</h4>
+        <div v-for="(result, server) in networkDiagnostic" :key="server" class="diagnostic-item">
+          <span class="server-name">{{ server }}:</span>
+          <span :class="['status-badge', result.success ? 'success' : 'failed']">
+            {{ result.success ? '✅ 可达' : '❌ 失败' }}
+          </span>
+          <span v-if="result.error" class="error-msg">{{ result.error }}</span>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -116,16 +131,46 @@ const localCopied = ref(false)
 const iceCandidates = ref<RTCIceCandidate[]>([])
 const isGatheringComplete = ref(false)
 
+// 网络诊断
+const networkDiagnostic = ref<Record<string, { success: boolean; error?: string }> | null>(null)
+
 // WebRTC 相关变量
 let localStream: MediaStream | null = null
 let peerConnection: RTCPeerConnection | null = null
 
-// ICE 服务器配置
+// ICE 服务器配置 - 添加更多 STUN 服务器和免费 TURN 服务器
 const iceServers = {
   iceServers: [
+    // Google STUN 服务器
     { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' }
-  ]
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
+    
+    // 其他公共 STUN 服务器
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:stun.nextcloud.com:443' },
+    
+    // 免费 TURN 服务器 (OpenRelay)
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ],
+  // 增加连接超时时间
+  iceCandidatePoolSize: 10
 }
 
 // 开启本地视频
@@ -173,20 +218,50 @@ const createPeerConnection = () => {
   
   peerConnection.oniceconnectionstatechange = () => {
     iceConnectionState.value = peerConnection!.iceConnectionState
+    console.log('ICE 连接状态变化:', peerConnection!.iceConnectionState)
+    
+    // 根据 ICE 状态更新连接状态
+    switch (peerConnection!.iceConnectionState) {
+      case 'checking':
+        connectionState.value = '正在检查网络连接...'
+        break
+      case 'connected':
+        connectionState.value = '连接成功！'
+        break
+      case 'completed':
+        connectionState.value = '连接已建立'
+        break
+      case 'failed':
+        connectionState.value = '连接失败 - 网络不可达'
+        console.error('ICE 连接失败，可能需要 TURN 服务器')
+        break
+      case 'disconnected':
+        connectionState.value = '连接已断开'
+        break
+      case 'closed':
+        connectionState.value = '连接已关闭'
+        break
+    }
   }
   
   // 收集 ICE 候选
   peerConnection.onicecandidate = (event) => {
     if (event.candidate) {
       iceCandidates.value.push(event.candidate)
-      console.log('新的 ICE 候选:', event.candidate)
+      console.log('新的 ICE 候选:', {
+        type: event.candidate.type,
+        protocol: event.candidate.protocol,
+        address: event.candidate.address,
+        port: event.candidate.port,
+        priority: event.candidate.priority
+      })
       
       // 实时更新信令数据，包含所有 ICE 候选
       updateSignalingWithCandidates()
     } else {
       // ICE 候选收集完成
       isGatheringComplete.value = true
-      console.log('ICE 候选收集完成')
+      console.log('ICE 候选收集完成，总共收集到', iceCandidates.value.length, '个候选')
       updateSignalingWithCandidates()
     }
   }
@@ -317,6 +392,67 @@ const copyLocalSignaling = async () => {
 // 清空远程信令
 const clearRemoteSignaling = () => {
   remoteSignaling.value = ''
+}
+
+// 网络诊断功能
+const testNetwork = async () => {
+  networkDiagnostic.value = null
+  connectionState.value = '正在进行网络诊断...'
+  
+  const testServers = [
+    { name: 'Google STUN', url: 'stun:stun.l.google.com:19302' },
+    { name: 'Cloudflare STUN', url: 'stun:stun.cloudflare.com:3478' },
+    { name: 'OpenRelay TURN', url: 'turn:openrelay.metered.ca:80' }
+  ]
+  
+  const results: Record<string, { success: boolean; error?: string }> = {}
+  
+  for (const server of testServers) {
+    try {
+      const testPC = new RTCPeerConnection({
+        iceServers: [
+          server.name.includes('TURN') 
+            ? { urls: server.url, username: 'openrelayproject', credential: 'openrelayproject' }
+            : { urls: server.url }
+        ]
+      })
+      
+      // 创建一个数据通道来触发 ICE 收集
+      testPC.createDataChannel('test')
+      
+      const offer = await testPC.createOffer()
+      await testPC.setLocalDescription(offer)
+      
+      // 等待 ICE 候选
+      const candidatePromise = new Promise<boolean>((resolve) => {
+        let hasCandidate = false
+        testPC.onicecandidate = (event) => {
+          if (event.candidate) {
+            hasCandidate = true
+            console.log(`${server.name} 产生候选:`, event.candidate.type)
+          } else if (hasCandidate) {
+            resolve(true)
+          }
+        }
+        
+        // 3秒超时
+        setTimeout(() => resolve(hasCandidate), 3000)
+      })
+      
+      const success = await candidatePromise
+      results[server.name] = { success }
+      testPC.close()
+      
+    } catch (error) {
+      results[server.name] = { 
+        success: false, 
+        error: error instanceof Error ? error.message : '未知错误' 
+      }
+    }
+  }
+  
+  networkDiagnostic.value = results
+  connectionState.value = '网络诊断完成'
 }
 
 // 处理远程信令
@@ -471,6 +607,14 @@ onUnmounted(() => {
   cursor: not-allowed;
 }
 
+.test-button {
+  background-color: #17a2b8 !important;
+}
+
+.test-button:hover:not(:disabled) {
+  background-color: #138496 !important;
+}
+
 .signaling-section {
   margin-bottom: 30px;
 }
@@ -578,6 +722,54 @@ onUnmounted(() => {
 .status p {
   margin: 5px 0;
   color: #333;
+}
+
+.diagnostic {
+  margin-top: 15px;
+  padding: 10px;
+  background-color: #f8f9fa;
+  border-radius: 5px;
+  border-left: 4px solid #17a2b8;
+}
+
+.diagnostic h4 {
+  margin: 0 0 10px 0;
+  color: #17a2b8;
+}
+
+.diagnostic-item {
+  display: flex;
+  align-items: center;
+  margin: 5px 0;
+  gap: 10px;
+}
+
+.server-name {
+  font-weight: bold;
+  min-width: 120px;
+}
+
+.status-badge {
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: bold;
+}
+
+.status-badge.success {
+  background-color: #d4edda;
+  color: #155724;
+}
+
+.status-badge.failed {
+  background-color: #f8d7da;
+  color: #721c24;
+}
+
+.error-msg {
+  font-size: 12px;
+  color: #6c757d;
+  font-style: italic;
 }
 
 @media (max-width: 768px) {
